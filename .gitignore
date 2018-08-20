@@ -1,0 +1,5 @@
+.env
+google-credentials
+node_modules
+.DS_Store
+.yo-rc.json

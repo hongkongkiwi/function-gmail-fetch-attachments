@@ -1,0 +1,6 @@
+.env
+google-credentials
+.DS_Store
+node_modules
+.npmignore
+.gitignore

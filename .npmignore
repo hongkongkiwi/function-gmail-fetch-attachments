@@ -1,0 +1,7 @@
+google-credentials
+node_modules
+.DS_Store
+.env
+.yo-rc.json
+.dockerignore
+.git
