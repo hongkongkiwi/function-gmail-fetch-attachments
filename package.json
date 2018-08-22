@@ -14,10 +14,13 @@
   "author": "Andy Savage <andy@savage.hk>",
   "license": "MIT",
   "dependencies": {
+    "@google-cloud/storage": "^1.7.0",
+    "google-auth-library": "^1.6.1",
     "googleapis": "^32.0.0",
-    "lodash.assign": "^4.2.0",
-    "lodash.isarray": "^4.0.0",
-    "lodash.isnumber": "^3.0.3",
-    "lodash.isstring": "^4.0.1"
+    "js-yaml": "^3.12.0",
+    "lodash": "^4.17.10",
+    "mz": "^2.7.0",
+    "tmp-promise": "^1.0.5",
+    "url": "^0.11.0"
   }
 }

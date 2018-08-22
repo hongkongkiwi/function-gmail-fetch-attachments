@@ -1,5 +1,8 @@
-.env
+.projectname
+.env.yaml
 google-credentials
 node_modules
 .DS_Store
 .yo-rc.json
+keys/*
+oauth_token_test

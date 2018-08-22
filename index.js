@@ -1,137 +1,245 @@
-const isArray = require('lodash.isarray')
-const isNumber = require('lodash.isnumber')
-const isString = require('lodash.isstring')
-const assign = require('lodash.assign')
-const gmail = require('googleapis').gmail('v1')
+'use strict'
 
-class GoogleGmail() {
-  constructor(newOpts) {
-    let opts = {
-      Promise: Promise,
-      userId: "me",
-      authClient: null
+//http://localhost:8010/squashed-melon/asia-northeast1/gmail-fetch-attachments/check?email=hkdrivesync%40sphero.com&label=jetta-production-daily-bolt
+
+const path = require('path')
+const {OAuth2Client} = require('google-auth-library')
+const {has,isNull,isUndefined,isArray,isObject} = require('lodash')
+const fs = require('mz/fs')
+//const {Buffer} = require('safe-buffer')
+//const path = require('path')
+//const os = require('os')
+
+// Lazy load global variables
+let bucket
+let token
+let keys
+let oAuth2Client
+let gmail
+let tmp
+let url
+let querystring
+let Storage
+let GoogleGmail
+
+/** Used when running on simulator **/
+const yamlFile = path.join(__dirname, '.env.yaml')
+
+if (fs.existsSync(yamlFile)) {
+  const yaml = require('js-yaml')
+  try {
+    const config = yaml.safeLoad(fs.readFileSync(yamlFile, 'utf8'))
+    for (let varName in config) {
+      process.env[varName] = config[varName]
     }
-    assign(this, opts, newOpts)
-
-    if (!this.authClient) {
-      return new Error("No Auth Client passed")
-    }
-
-    // var RateLimiter = require('limiter').RateLimiter
-    // if (!isNull(this.RateLimiter) && !isUndefined(this.RateLimiter)) {
-    //   this.limiter = new RateLimiter(1, 250)
-    // }
-    // var limiter = new RateLimiter(1, 250)
-    // var requestsToday = 0 // Gets reset on each "new" day
-    // var requestsLimitPerDay = 200
+  } catch (e) {
+    console.error(e)
+    process.exit(1)
   }
+  process.env.HTTP_TRIGGER_ENDPOINT = 'http://localhost:8010/squashed-melon/asia-northeast1/' + process.env.FUNCTION_NAME
+}
 
-  // async loadCredentials(credentialsFile) {
-  //   let credentials
-  //   if (isString(credentialsFile)) {
-  //     credentials = JSON.parse(await readFileAsync(credentialsFile, 'utf8'))
-  //   }
-  //   if (isEmpty(credentials) || !isObject(credentials)) {
-  //     return Promise.reject("No credentials passed")
-  //   }
-  //   this.credentials = credentials
-  //   this.authClient = new google.auth.JWT(
-  //     this.credentials.client_email,
-  //     null,
-  //     this.credentials.private_key,
-  //     this.authScopes
-  //   )
-  //   return Promise.resolve()
-  // }
+// Variables
+const redirectCheckPath = "/check"
+const projectId = process.env.GCP_PROJECT
+const bucketName = process.env.OAUTH2_STORAGE_BUCKET
+const credsOauthClient = process.env.CREDENTIALS_OAUTH_CLIENT ? path.join(__dirname, process.env.CREDENTIALS_OAUTH_CLIENT.split('/').join(path.sep)) : null
+const credsStorageService = process.env.CREDENTIALS_STORAGE_SERVICE ? path.join(__dirname, process.env.CREDENTIALS_STORAGE_SERVICE.split('/').join(path.sep)) : null
+const encryptionKey = process.env.OAUTH2_ENCRYPTION_KEY ? Buffer.from(process.env.OAUTH2_ENCRYPTION_KEY, 'base64') : null
 
-  /**
-   * Lists the labels in the user's account.
-   */
-  async listLabels() {
-    const params = {
-      auth: this.authClient,
-      userId: this.userId
+if (isNull(bucketName) ||
+    isNull(credsOauthClient) ||
+    isNull(credsStorageService)) {
+      throw new Error("Environment Variables not available!")
     }
-    return await gmail.users.messages.list(params)
-  }
 
-  /**
-   * Get Attachments from a given Message.
-   *
-   * @param  {String} messageId ID of Message with attachments.
-   */
-  async getAllMessageAttachments(messageId) {
-    const parts = messsage.payload.parts;
-    let attachments = []
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i]
-      if (part.filename && part.filename.length > 0) {
-        const attachment = await getMessageAttachment(part.body.attachmentId, messageId)
-        attachments.push(attachment)
+const verifyAndExtractToken = async (id_token) => {
+  const ticket = await oAuth2Client.verifyIdToken({
+      idToken: id_token,
+      audience: keys.installed.client_id,  // Specify the CLIENT_ID of the app that accesses the backend
+  })
+  return ticket.getPayload()
+  // console.log(payload)
+  // const userid = payload.sub
+  // const domain = payload.hd
+}
+
+const debugLog = (msg) => {
+  console.log(msg)
+}
+
+const createTempFile = async () => {
+  tmp = tmp || require('tmp-promise')
+  return await tmp.tmpName()
+}
+
+const getTokenFile = async (srcFile, encKey) => {
+  const tempFile = await createTempFile()
+  const file = bucket.file(srcFile)
+  const checkFileExists = _=>{
+    return file.exists().then((data)=>{ return data[0] })
+  }
+  if (!await checkFileExists()) {
+    debugLog('Token does not exist!')
+    return null
+  }
+  let options = {
+    destination: tempFile
+  }
+  if (encKey) options.encryptionKey = encKey
+  debugLog('File Exists trying to download')
+  await file.download(options)
+  debugLog(`File ${srcFile} downloaded to ${tempFile}.`);
+  return tempFile
+}
+
+const getToken = async (email) => {
+  const storageTokenFile = 'tokens/' + email + '.json'
+  debugLog("Attempting to get token: " + storageTokenFile)
+  const tempTokenFile = await getTokenFile(storageTokenFile, encryptionKey)
+  if (isNull(tempTokenFile)) {
+    debugLog("No Token file available from Cloud Storage")
+    return null
+  }
+  debugLog("Got Token File from Cloud Storage")
+  const tokenFileContents = await fs.readFile(tempTokenFile)
+  const newToken = JSON.parse(tokenFileContents)
+  await fs.unlink(tempTokenFile)
+  return newToken
+}
+
+const storeToken = async (srcFilename, dstFilename, encKey) => {
+  let options = {
+    destination: dstFilename
+  }
+  if (encKey) options.encryptionKey = encKey
+  await bucket.upload(srcFilename, options)
+  debugLog(`File ${srcFilename} uploaded to gs://${bucketName}/${dstFilename}.`)
+}
+
+const getKeys = async () => {
+  const keysFileContents = await fs.readFile(credsOauthClient)
+  const keys = JSON.parse(keysFileContents)
+  if (!has(keys, 'installed') ||
+      !has(keys.installed, 'client_id') ||
+      !has(keys.installed, 'client_secret') ||
+      !has(keys.installed, 'redirect_uris') ||
+      !isArray(keys.installed.redirect_uris) ||
+      keys.installed.redirect_uris.length === 0) {
+        throw new Error('Invalid keys file!')
       }
-    }
-    return attachments
-  }
+  return keys
+}
 
-  async getMessageAttachment(attachmentId, messageId) {
-    const params = {
-      auth: this.authClient,
-      userId: this.userId,
-      id: attachmentId,
-      messageId: messageId
-    }
-    return await gmail.users.messages.get(params)
-  }
+const handleGet = async (req, res) => {
+  querystring = querystring || require('querystring')
+  url = url || require('url')
+  const urlPath = url.parse(req.url).path.split('?')[0]
 
-  /**
-   * Get Message with given ID.
-   *
-   * @param  {String} messageId ID of Message to get.
-   * @param  {Function} callback Function to call when the request is complete.
-   */
-  async getMessage(messageId) {
-    const params = {
-      auth: this.authClient,
-      userId: this.userId,
-      id: messageId
+  if (urlPath === '/' || (urlPath !== redirectCheckPath)) {
+    debugLog('Invalid path passed: ' + urlPath)
+    return handleError('Invalid path passed', res)
+  } else {
+    const urlQS = querystring.parse(url.parse(req.url).query)
+    if (!has(urlQS, 'label') || isNull(urlQS.label)) {
+      debugLog('Invalid label passed: ' + JSON.stringify(urlQS))
+      return handleError('Invalid label passed', res)
     }
-    return await gmail.users.messages.get(params)
-  }
-
-  /**
-   * Trash the specified message.
-   */
-  async trashMessage(messageId) {
-    const params = {
-      auth: this.authClient,
-      userId: this.userId,
-      id: messageId
+    if (!has(urlQS, 'email') || isNull(urlQS.email)) {
+      debugLog('Invalid email passed: ' + JSON.stringify(urlQS))
+      return handleError('Invalid email passed', res)
     }
-    return await gmail.users.messages.trash(params)
-  }
-
-  /**
-   * Retrieve Messages in user's mailbox matching query.
-   */
-  async listMessages(maxResults, query, labelIds, includeSpamTrash) {
-    let params = {
-      auth: this.authClient,
-      userId: this.userId,
-      includeSpamTrash: includeSpamTrash || false,
+    Storage = Storage || require('@google-cloud/storage')
+    bucket = bucket || new Storage({
+                            projectId: projectId,
+                            keyFilename: credsStorageService
+                        }).bucket(bucketName)
+    debugLog("Initialized bucket")
+    keys = keys || await getKeys()
+    debugLog("Initialized keys" + JSON.stringify(keys,null,0))
+    oAuth2Client = oAuth2Client || new OAuth2Client(
+                                      keys.installed.client_id,
+                                      keys.installed.client_secret)
+    const email = urlQS.email
+    token = token || await getToken(email)
+    if (!token) {
+      return handleError("No Auth token available", res)
+    } else if (isNull(token) || !isObject(token) || !has(token, 'id_token')) {
+      return handleError("Invalid Auth Token", res)
     }
-    if (labelIds && isArray(labelIds)) params.labelIds = labelIds
-    if (maxResults && isNumber(maxResults) && maxResults >= 0) params.maxResults = maxResults
-    if (query && isString(query)) params.query = query
-    let messageIds = []
-    // Keep getting messages as long as we have a pageToken
-    while {
-      const response = await gmail.users.messages.list(params)
-      params.pageToken = response.nextPageToken
-      messageIds.concat(response.messages)
-      if (!params.pageToken) break
+    // Handle the refresh event
+    oAuth2Client.on('tokens', async (tokens) => {
+      if (tokens.refresh_token) {
+        token = tokens
+        const tempFile = createTempFile()
+        await fs.writeFile(tempFile, JSON.stringify(token,null,0), {encoding: 'utf8', flag: 'w'})
+        const storageTokenFile = 'tokens/' + email + '.json'
+        await storeToken(tempFile, storageTokenFile)
+        await fs.unlink(tempFile)
+      }
+    })
+    oAuth2Client.setCredentials(token)
+    const details = await verifyAndExtractToken(token.id_token)
+    await oAuth2Client.refreshAccessToken()
+    const label = urlQS.label
+    debugLog('Downloading Messages for label ' + label)
+    GoogleGmail = GoogleGmail || require('./gmail')
+    gmail = new GoogleGmail({
+      authClient: oAuth2Client,
+      userId: email
+    })
+    try {
+      const label = await gmail.getLabelWithName('Testing/SPRK+')
+      console.log('Label ID:',label.id,'for name "' + label.name + '"')
+      const labelIds = [label.id]
+      const messageIds = await gmail.listMessages(1, null, labelIds, false)
+      console.log('Got Message ID', messageId)
+      for (let messageId in messageIds) {
+        console.log('Found messageId: ', messageId)
+        const message = await gmail.getMessage(messageId.id)
+        console.log('Message', message)
+        const attachments = await gmail.getAttachmentsFromMessage(message)
+        console.log('Message Attachments', attachments)
+      }
+    } catch(err) {
+      console.error(err)
+      return handleError('Error trying to get or save token', res)
     }
-    return messageIds
+    handleSuccess('Successfully downloaded messages', res)
   }
 }
 
-module.exports = GoogleGmail
+const handleSuccess = (msg, res) => {
+  res.status(200).end(msg)
+}
+
+const handleError = (msg, res) => {
+  console.error(msg)
+  res.status(400).end('An error occured')
+}
+
+/*
+*  @function http
+*  @param {object} request object received from the caller
+*  @param {object} response object created in response to the request
+*/
+exports.http = async (req, res) => {
+  switch (req.method) {
+    case 'GET':
+      handleGet(req, res)
+      break
+    default:
+      handleError(`Invalid Method ${req.method}`, res)
+      break
+  }
+}
+
+/*
+*
+*  @function eventHelloWorld
+*  @param { Object } event read event from configured pubsub topic
+*  @param { Function } callback function
+*/
+// exports.eventHelloWorld = (event, callback) => {
+//   callback(`Hello ${event.data.name || 'World'}!`)
+// }
