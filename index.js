@@ -1,17 +1,18 @@
 'use strict'
 
-//http://localhost:8010/squashed-melon/asia-northeast1/gmail-fetch-attachments/check?email=hkdrivesync%40sphero.com&label=jetta-production-daily-bolt
+//http://localhost:8010/squashed-melon/asia-northeast1/gmail-fetch-attachments/check?email=hkdrivesync%40sphero.com&label=Jetta%20Production%20Daily/SPRK%2B&product=SPRK%2B
 
 const path = require('path')
 const {OAuth2Client} = require('google-auth-library')
-const {has,isNull,isUndefined,isArray,isObject} = require('lodash')
+const {has,isNull,isUndefined,isArray,isObject,filter} = require('lodash')
 const fs = require('mz/fs')
 //const {Buffer} = require('safe-buffer')
 //const path = require('path')
 //const os = require('os')
 
 // Lazy load global variables
-let bucket
+let oauth2Bucket
+let attachmentsBucket
 let token
 let keys
 let oAuth2Client
@@ -21,6 +22,9 @@ let url
 let querystring
 let Storage
 let GoogleGmail
+let moment
+let mimeTypes
+let email
 
 /** Used when running on simulator **/
 const yamlFile = path.join(__dirname, '.env.yaml')
@@ -42,12 +46,15 @@ if (fs.existsSync(yamlFile)) {
 // Variables
 const redirectCheckPath = "/check"
 const projectId = process.env.GCP_PROJECT
-const bucketName = process.env.OAUTH2_STORAGE_BUCKET
+const oauth2BucketName = process.env.OAUTH2_STORAGE_BUCKET
+const attachmentsBucketName = process.env.ATTACHMENTS_STORAGE_BUCKET
+const attachmentsStoragePrefix = process.env.ATTACHMENTS_STORAGE_PREFIX || ""
 const credsOauthClient = process.env.CREDENTIALS_OAUTH_CLIENT ? path.join(__dirname, process.env.CREDENTIALS_OAUTH_CLIENT.split('/').join(path.sep)) : null
 const credsStorageService = process.env.CREDENTIALS_STORAGE_SERVICE ? path.join(__dirname, process.env.CREDENTIALS_STORAGE_SERVICE.split('/').join(path.sep)) : null
-const encryptionKey = process.env.OAUTH2_ENCRYPTION_KEY ? Buffer.from(process.env.OAUTH2_ENCRYPTION_KEY, 'base64') : null
+const timezone = process.env.TIMEZONE || 'Asia/Tokyo'
 
-if (isNull(bucketName) ||
+if (isNull(oauth2BucketName) ||
+    isNull(attachmentsBucketName) ||
     isNull(credsOauthClient) ||
     isNull(credsStorageService)) {
       throw new Error("Environment Variables not available!")
@@ -75,7 +82,7 @@ const createTempFile = async () => {
 
 const getTokenFile = async (srcFile, encKey) => {
   const tempFile = await createTempFile()
-  const file = bucket.file(srcFile)
+  const file = oauth2Bucket.file(srcFile)
   const checkFileExists = _=>{
     return file.exists().then((data)=>{ return data[0] })
   }
@@ -96,7 +103,7 @@ const getTokenFile = async (srcFile, encKey) => {
 const getToken = async (email) => {
   const storageTokenFile = 'tokens/' + email + '.json'
   debugLog("Attempting to get token: " + storageTokenFile)
-  const tempTokenFile = await getTokenFile(storageTokenFile, encryptionKey)
+  const tempTokenFile = await getTokenFile(storageTokenFile)
   if (isNull(tempTokenFile)) {
     debugLog("No Token file available from Cloud Storage")
     return null
@@ -110,11 +117,29 @@ const getToken = async (email) => {
 
 const storeToken = async (srcFilename, dstFilename, encKey) => {
   let options = {
-    destination: dstFilename
+    destination: dstFilename,
+    uploadType: 'media',
+    metadata: {
+      contentType: 'application/json'
+    }
   }
   if (encKey) options.encryptionKey = encKey
-  await bucket.upload(srcFilename, options)
-  debugLog(`File ${srcFilename} uploaded to gs://${bucketName}/${dstFilename}.`)
+  await oauth2Bucket.upload(srcFilename, options)
+  debugLog(`File ${srcFilename} uploaded to gs://${oauth2BucketName}/${dstFilename}.`)
+}
+
+const storeReport = async (srcFilename, dstFilename, mimeType, metadata, encKey) => {
+  let options = {
+    destination: dstFilename,
+    uploadType: 'media',
+    metadata: {
+      contentType: mimeType,
+      metadata: metadata
+    }
+  }
+  if (encKey) options.encryptionKey = encKey
+  await attachmentsBucket.upload(srcFilename, options)
+  debugLog(`File ${srcFilename} uploaded to gs://${attachmentsBucketName}/${dstFilename}.`)
 }
 
 const getKeys = async () => {
@@ -129,6 +154,27 @@ const getKeys = async () => {
         throw new Error('Invalid keys file!')
       }
   return keys
+}
+
+const storeAttachments = async (attachments, mimeType, productName, emailDate) => {
+  attachmentsBucket = attachmentsBucket || new Storage({
+                          projectId: projectId,
+                          keyFilename: credsStorageService
+                      }).bucket(attachmentsBucketName)
+  moment = moment || require('moment-timezone')
+  attachments = filter(attachments, { mimeType })
+  mimeTypes = mimeTypes || require('mime-types')
+  const extension = mimeTypes.extension(mimeType)
+  for (let attachment of attachments) {
+    const date = moment(parseInt(emailDate)).tz(timezone).format("YY-MM-DD")
+    const clippedFilename = path.basename(attachment.filename, path.extname(attachment.filename))
+    const filename = path.join(attachmentsStoragePrefix,productName,`${productName}_${date}_${clippedFilename}.${extension}`)
+    const tempFile = await createTempFile()
+    console.log(attachment.data)
+    await fs.writeFile(tempFile, attachment.data, {encoding: 'binary', flag: 'w'})
+    await storeReport(tempFile, filename, mimeType, {product: productName, email: email})
+    await fs.unlink(tempFile)
+  }
 }
 
 const handleGet = async (req, res) => {
@@ -149,18 +195,22 @@ const handleGet = async (req, res) => {
       debugLog('Invalid email passed: ' + JSON.stringify(urlQS))
       return handleError('Invalid email passed', res)
     }
+    if (!has(urlQS, 'product') || isNull(urlQS.product)) {
+      debugLog('Invalid product passed: ' + JSON.stringify(urlQS))
+      return handleError('Invalid product passed', res)
+    }
     Storage = Storage || require('@google-cloud/storage')
-    bucket = bucket || new Storage({
+    oauth2Bucket = oauth2Bucket || new Storage({
                             projectId: projectId,
                             keyFilename: credsStorageService
-                        }).bucket(bucketName)
+                        }).bucket(oauth2BucketName)
     debugLog("Initialized bucket")
     keys = keys || await getKeys()
     debugLog("Initialized keys" + JSON.stringify(keys,null,0))
     oAuth2Client = oAuth2Client || new OAuth2Client(
                                       keys.installed.client_id,
                                       keys.installed.client_secret)
-    const email = urlQS.email
+    email = urlQS.email
     token = token || await getToken(email)
     if (!token) {
       return handleError("No Auth token available", res)
@@ -181,25 +231,30 @@ const handleGet = async (req, res) => {
     oAuth2Client.setCredentials(token)
     const details = await verifyAndExtractToken(token.id_token)
     await oAuth2Client.refreshAccessToken()
-    const label = urlQS.label
-    debugLog('Downloading Messages for label ' + label)
+    const labelName = urlQS.label
+    const productName = urlQS.product
+    debugLog('Downloading Messages for label ' + labelName)
     GoogleGmail = GoogleGmail || require('./gmail')
     gmail = new GoogleGmail({
       authClient: oAuth2Client,
       userId: email
     })
     try {
-      const label = await gmail.getLabelWithName('Testing/SPRK+')
+      const label = await gmail.getLabelWithName(labelName)
+      if (!label) {
+        return handleError("Invalid label: " + labelName, res)
+      }
       console.log('Label ID:',label.id,'for name "' + label.name + '"')
       const labelIds = [label.id]
       const messageIds = await gmail.listMessages(1, null, labelIds, false)
-      console.log('Got Message ID', messageId)
-      for (let messageId in messageIds) {
+      console.log('Got Message IDs', messageIds)
+      for (let messageId of messageIds) {
         console.log('Found messageId: ', messageId)
         const message = await gmail.getMessage(messageId.id)
-        console.log('Message', message)
+        console.log('Got Message Content')
         const attachments = await gmail.getAttachmentsFromMessage(message)
         console.log('Message Attachments', attachments)
+        await storeAttachments(attachments, 'application/vnd.ms-excel', productName, message.internalDate)
       }
     } catch(err) {
       console.error(err)

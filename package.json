@@ -19,6 +19,8 @@
     "googleapis": "^32.0.0",
     "js-yaml": "^3.12.0",
     "lodash": "^4.17.10",
+    "mime-types": "^2.1.19",
+    "moment-timezone": "^0.5.21",
     "mz": "^2.7.0",
     "tmp-promise": "^1.0.5",
     "url": "^0.11.0"
